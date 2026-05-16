@@ -132,6 +132,7 @@ def opencode(
             sbox = sandbox_env(sandbox)
 
             # install skills
+            skills_prompt: str | None = None
             if resolved_skills is not None:
                 OPENCODE_SKILLS = ".opencode/skills"
                 skills_dir = (
@@ -140,6 +141,7 @@ def opencode(
                     else OPENCODE_SKILLS
                 )
                 await install_skills(resolved_skills, sbox, user, skills_dir)
+                skills_prompt = _skills_system_prompt(skills_dir, resolved_skills)
 
             # install node and opencode in sandbox
             opencode_binary, node_binary = await ensure_opencode_setup(
@@ -186,6 +188,8 @@ def opencode(
             ]
             if system_prompt is not None:
                 system_messages.append(system_prompt)
+            if skills_prompt is not None:
+                system_messages.append(skills_prompt)
 
             prompt, has_assistant_response = build_user_prompt(state.messages)
 
@@ -297,6 +301,22 @@ def opencode(
         return bridge.state
 
     return agent_with(execute, name=name, description=description)
+
+
+def _skills_system_prompt(skills_dir: str, skills: Sequence[Skill]) -> str:
+    entries = []
+    for skill in skills:
+        skill_dir = f"{skills_dir}/{skill.name}"
+        paths = [f"instructions: {skill_dir}/SKILL.md"]
+        paths += [f"asset: {skill_dir}/assets/{name}" for name in skill.assets]
+        paths += [f"script: {skill_dir}/scripts/{name}" for name in skill.scripts]
+        entries.append(f"- {skill.name}: {skill.description}; {'; '.join(paths)}")
+
+    return (
+        "OpenCode skills are installed in the sandbox. Read SKILL.md directly "
+        "instead of calling the skill tool; resolve relative paths from the skill directory.\n\n"
+        + "\n".join(entries)
+    )
 
 
 def resolve_mcp_servers(
