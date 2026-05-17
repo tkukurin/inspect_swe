@@ -4,6 +4,7 @@ from pathlib import Path
 from textwrap import dedent
 from typing import Any, Literal, Sequence
 
+import anyio
 from inspect_ai.agent import (
     Agent,
     AgentAttempts,
@@ -13,7 +14,14 @@ from inspect_ai.agent import (
     agent_with,
     sandbox_agent_bridge,
 )
-from inspect_ai.model import ChatMessageSystem, GenerateFilter, Model
+from inspect_ai.model import (
+    ChatMessageSystem,
+    GenerateConfig,
+    GenerateFilter,
+    GenerateInput,
+    Model,
+    ModelOutput,
+)
 from inspect_ai.scorer import score
 from inspect_ai.tool import MCPServerConfig, Skill, install_skills, read_skills
 from inspect_ai.tool._mcp._config import MCPServerConfigHTTP
@@ -118,11 +126,30 @@ def opencode(
         port = store().get(MODEL_PORT, 3000) + 1
         store().set(MODEL_PORT, port)
 
+        # OpenCode retries indefinitely on API errors; cancel exec_remote on 4xx.
+        scope = anyio.CancelScope()
+        api_error: Exception | None = None
+
+        async def _filter(
+            mdl: Model, msgs: list[Any], tools: list[Any],
+            tc: Any, cfg: GenerateConfig,
+        ) -> ModelOutput | GenerateInput | None:
+            nonlocal api_error
+            try:
+                if filter and (r := await filter(mdl, msgs, tools, tc, cfg)):  # type: ignore[arg-type]
+                    return r
+                return await mdl.generate(msgs, tools, tc, cfg)
+            except Exception as e:
+                if "400" in str(e):
+                    api_error = e
+                    scope.cancel()
+                raise
+
         async with sandbox_agent_bridge(
             state,
             model=model,
             model_aliases=model_aliases,
-            filter=filter,
+            filter=_filter,
             sandbox=sandbox,
             retry_refusals=retry_refusals,
             port=port,
@@ -249,28 +276,31 @@ def opencode(
                     agent_cmd.append(agent_prompt)
 
                     # run agent
-                    result = await sbox.exec_remote(
-                        cmd=["bash", "-c", 'exec 0</dev/null; "$@"', "bash"]
-                        + agent_cmd,
-                        options=ExecRemoteAwaitableOptions(
-                            cwd=cwd,
-                            env=agent_env,
-                            user=user,
-                            concurrency=False,
-                        ),
-                        stream=False,
-                    )
-
-                    debug_output.append(result.stdout)
-                    debug_output.append(result.stderr)
-
-                    if not result.success:
-                        cli_error_msg = _clean_opencode_error(
-                            result.stdout, result.stderr
+                    with scope:
+                        result = await sbox.exec_remote(
+                            cmd=["bash", "-c", 'exec 0</dev/null; "$@"', "bash"]
+                            + agent_cmd,
+                            options=ExecRemoteAwaitableOptions(
+                                cwd=cwd,
+                                env=agent_env,
+                                user=user,
+                                concurrency=False,
+                            ),
+                            stream=False,
                         )
+                        debug_output.append(result.stdout)
+                        debug_output.append(result.stderr)
+                        if not result.success:
+                            cli_error_msg = _clean_opencode_error(
+                                result.stdout, result.stderr
+                            )
+                            raise RuntimeError(
+                                f"Error executing opencode agent {result.returncode}: {cli_error_msg}"
+                            )
+                    if scope.cancelled_caught:
                         raise RuntimeError(
-                            f"Error executing opencode agent {result.returncode}: {cli_error_msg}"
-                        )
+                            f"Model API error (OpenCode would retry forever): {api_error}"
+                        ) from api_error
 
                     attempt_count += 1
                     if attempt_count >= attempts.attempts:
